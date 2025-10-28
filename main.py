@@ -171,7 +171,7 @@ class FileUploadServer:
                     logger.error(f"覆盖上传：删除旧文件失败 {filename}: {e}")
                     return web.json_response({'error': 'Failed to delete existing file for overwrite'}, status=500)
 
-            # 初始化或更新上传状态
+            # 初始化或更新上传状态 - 修复：确保状态字典结构完整
             if file_id not in self.upload_status:
                 self.upload_status[file_id] = {
                     'filename': filename,
@@ -192,15 +192,26 @@ class FileUploadServer:
                 }
                 self.upload_start_time[file_id] = time.time()
             else:
-                # 如果是覆盖上传，重置进度相关数据
-                if overwrite_confirmed:
-                    self.upload_status[file_id]['uploaded_size'] = 0
-                    self.upload_status[file_id]['chunks_received'] = 0
-                    self.upload_status[file_id]['chunks_verified'] = 0
-                    self.upload_status[file_id]['received_chunks'] = {}
-                    self.upload_status[file_id]['status'] = 'uploading'
+                # 如果是覆盖上传或重新上传，重置进度相关数据
+                if overwrite_confirmed or self.upload_status[file_id].get('status') in ['cancelled', 'completed', 'failed']:
+                    self.upload_status[file_id] = {
+                        'filename': filename,
+                        'total_size': file_size,
+                        'total_chunks': total_chunks,
+                        'uploaded_size': 0,
+                        'chunks_received': 0,
+                        'chunks_verified': 0,
+                        'received_chunks': {},  # 重置chunks
+                        'status': 'uploading',
+                        'start_time': time.time(),
+                        'chunk_hashes': [None] * total_chunks,
+                        'error_chunks': [],
+                        'verified_chunks': set(),
+                        'expected_file_hash': expected_file_hash,
+                        'actual_file_hash': '',
+                        'integrity_verified': False
+                    }
                     self.upload_start_time[file_id] = time.time()
-                    self.upload_status[file_id]['integrity_verified'] = False
 
             # 验证chunk哈希
             actual_chunk_hash = self.sha256_hex(chunk_data)
@@ -441,7 +452,10 @@ class FileUploadServer:
                 self.upload_status[file_id]['status'] = 'cancelled'
                 # 清理相关数据，但保留状态记录
                 if 'received_chunks' in self.upload_status[file_id]:
-                    del self.upload_status[file_id]['received_chunks']
+                    self.upload_status[file_id]['received_chunks'] = {}  # 清空chunks，而不是删除键
+                    self.upload_status[file_id]['chunks_received'] = 0
+                    self.upload_status[file_id]['chunks_verified'] = 0
+                    self.upload_status[file_id]['uploaded_size'] = 0
             
             # 广播取消消息
             cancel_data = {
@@ -518,6 +532,23 @@ class FileUploadServer:
             return web.json_response({'files': files})
         except Exception as e:
             logger.error(f"List files error: {str(e)}")
+            return web.json_response({'error': str(e)}, status=500)
+    
+    async def handle_download(self, request):
+        """处理文件下载请求"""
+        try:
+            filename = request.query.get('filename')
+            if not filename:
+                return web.json_response({'error': 'Missing filename'}, status=400)
+            
+            file_path = self.upload_dir / filename
+            if not file_path.exists():
+                return web.json_response({'error': 'File not found'}, status=404)
+            
+            # 返回文件内容
+            return web.FileResponse(file_path)
+        except Exception as e:
+            logger.error(f"Download error: {str(e)}")
             return web.json_response({'error': str(e)}, status=500)
     
     def format_file_size(self, size_bytes):
@@ -641,6 +672,17 @@ class FileUploadServer:
                                         'chunks': resend_data
                                     }
                                     await ws.send_str(json.dumps(response))
+                        elif msg_type == 'download_file':
+                            # 处理下载请求
+                            filename = data.get('filename')
+                            if filename:
+                                # 发送下载响应
+                                download_response = {
+                                    'type': 'download_response',
+                                    'filename': filename,
+                                    'download_url': f'/download?filename={filename}'
+                                }
+                                await ws.send_str(json.dumps(download_response))
                     except json.JSONDecodeError:
                         logger.error("Invalid JSON received from WebSocket")
                     except Exception as e:
@@ -956,18 +998,79 @@ class FileUploadServer:
             background-color: #fff3cd;
             color: #856404;
         }
+        .hash-cell {
+            position: relative;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .hash-cell:hover {
+            overflow: visible;
+            white-space: normal;
+            word-break: break-all;
+        }
+        .hash-cell:hover::after {
+            content: "";
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 100%;
+            background: linear-gradient(transparent, white);
+            pointer-events: none;
+        }
+        /* 添加到现有CSS中的新样式 */
+        .file-name-cell {
+            position: relative;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .file-name-cell:hover {
+            overflow: visible;
+            white-space: normal;
+            word-break: break-all;
+        }
+
+        .file-name-cell:hover::after {
+            content: "";
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 100%;
+            background: linear-gradient(transparent, white);
+            pointer-events: none;
+        }
+        .download-btn {
+            background-color: #28a745;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 5px;
+        }
+        .download-btn:hover {
+            background-color: #218838;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>文件上传服务</h1>
+            <h1>IPV6公网网盘</h1>
             <div class="personal-info">
-                <p>小阳</p>
-                <p>GitHub: <a href="https://github.com/yuunnn-w" target="_blank">https://github.com/yuunnn-w</a></p>
+                <p>开发者：小阳</p>
+                <p>GitHub项目地址: <a href="https://github.com/yuunnn-w/IPv6-File-Upload-Server" target="_blank">GitHub</a></p>
             </div>
         </div>
         <p class="subtitle">支持大文件分块上传和实时进度显示</p>
+	<p class="subtitle">- 注意，文件上传有校验，但文件下载无校验，如需校验请自行计算sha256 -</p>
         
         <div id="connectionStatus" class="connection-status disconnected">
             WebSocket: 连接中...
@@ -1017,10 +1120,6 @@ class FileUploadServer:
             </div>
         </div>
         
-        <div id="integrityStatus" class="integrity-status integrity-pending" style="display: none;">
-            文件完整性验证: 待验证
-        </div>
-        
         <div id="statusDiv"></div>
         
         <div class="file-list-container">
@@ -1032,10 +1131,11 @@ class FileUploadServer:
                         <th>大小</th>
                         <th>修改时间</th>
                         <th>哈希值</th>
+                        <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="fileListBody">
-                    <tr><td colspan="4">正在加载...</td></tr>
+                    <tr><td colspan="5">正在加载...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -1120,18 +1220,7 @@ class FileUploadServer:
                         } else if (data.type === 'upload_complete') {
                             // 设置上传完成标志
                             uploadCompleted = true;
-                            
-                            // 显示完整性验证状态
-                            const integrityStatusDiv = document.getElementById('integrityStatus');
-                            if (data.integrity_verified) {
-                                integrityStatusDiv.textContent = `文件完整性验证: 已通过 (哈希: ${data.file_hash.substring(0, 16)}...)`;
-                                integrityStatusDiv.className = 'integrity-status integrity-verified';
-                            } else {
-                                integrityStatusDiv.textContent = '文件完整性验证: 未通过或未提供预期哈希';
-                                integrityStatusDiv.className = 'integrity-status integrity-failed';
-                            }
-                            integrityStatusDiv.style.display = 'block';
-                            
+                                                        
                             // 在statusDiv中显示详细的上传完成统计信息
                             const filename = data.filename || '未知文件';
                             const total_size = data.total_size || 0;
@@ -1199,7 +1288,6 @@ class FileUploadServer:
                         } else if (data.type === 'upload_error') {
                             // 隐藏上传进度信息
                             document.getElementById('uploadProgressInfo').style.display = 'none';
-                            document.getElementById('integrityStatus').style.display = 'none';
                             
                             document.getElementById('statusDiv').textContent = 
                                 `上传失败: ${data.filename} - ${data.error}`;
@@ -1226,7 +1314,6 @@ class FileUploadServer:
                         } else if (data.type === 'upload_cancelled') {
                             // 隐藏上传进度信息
                             document.getElementById('uploadProgressInfo').style.display = 'none';
-                            document.getElementById('integrityStatus').style.display = 'none';
                             
                             document.getElementById('statusDiv').textContent = '上传已取消';
                             document.getElementById('statusDiv').className = 'status info';
@@ -1262,6 +1349,16 @@ class FileUploadServer:
                         } else if (data.type === 'file_list_update') {
                             // 接收到文件列表更新
                             displayFileList(data.files);
+                        } else if (data.type === 'download_response') {
+                            // 处理下载响应
+                            const { filename, download_url } = data;
+                            // 直接发起下载
+                            const link = document.createElement('a');
+                            link.href = download_url;
+                            link.download = filename;
+                            document.body.appendChild(link);
+                            link.click();
+                            document.body.removeChild(link);
                         }
                     } catch (e) {
                         console.error('处理WebSocket消息出错:', e);
@@ -1343,9 +1440,6 @@ class FileUploadServer:
             document.getElementById('chunksVerified').textContent = '0';
             document.getElementById('currentProgressText').textContent = '选择文件开始上传';
             document.getElementById('uploadProgressInfo').style.display = 'none';
-            document.getElementById('integrityStatus').style.display = 'none';
-            // document.getElementById('statusDiv').textContent = '';
-            // document.getElementById('statusDiv').className = '';
             // 重置上传完成标志
             uploadCompleted = false;
         }
@@ -1381,7 +1475,7 @@ class FileUploadServer:
             if (selectedFile) {
                 document.getElementById('fileName').textContent = `已选择: ${selectedFile.name}`;
                 document.getElementById('fileDetails').textContent = 
-                    `${formatFileSize(selectedFile.size)} (${selectedFile.type || '未知类型'})}`;
+                    `${formatFileSize(selectedFile.size)} (${selectedFile.type || '未知类型'})`;
                 
                 // 计算预计分块数
                 const chunkSize = 131072; // 128KB
@@ -1716,7 +1810,7 @@ class FileUploadServer:
         function displayFileList(files) {
             const tbody = document.getElementById('fileListBody');
             if (files.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4">暂无文件</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5">暂无文件</td></tr>';
                 return;
             }
             
@@ -1726,13 +1820,33 @@ class FileUploadServer:
                 const formattedDate = date.toLocaleString();
                 html += `
                 <tr>
-                    <td title="${file.name}">${file.name.length > 20 ? file.name.substring(0, 20) + '...' : file.name}</td>
+                    <td class="file-name-cell" title="${file.name}">${file.name || ''}</td>
                     <td>${file.size_formatted}</td>
                     <td>${formattedDate}</td>
-                    <td title="${file.hash}">${file.hash.substring(0, 16)}...</td>
+                    <td class="hash-cell" title="${file.hash}">${file.hash || ''}</td>
+                    <td><button class="download-btn" onclick="downloadFile('${file.name}')">下载</button></td>
                 </tr>`;
             });
             tbody.innerHTML = html;
+        }
+        
+        // 下载文件
+        function downloadFile(filename) {
+            if (isConnected && websocket && websocket.readyState === WebSocket.OPEN) {
+                // 通过WebSocket发送下载请求
+                websocket.send(JSON.stringify({
+                    type: 'download_file',
+                    filename: filename
+                }));
+            } else {
+                // WebSocket不可用时，直接发起下载请求
+                const link = document.createElement('a');
+                link.href = `/download?filename=${encodeURIComponent(filename)}`;
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
         }
         
         // 转义HTML特殊字符，防止XSS
@@ -1764,6 +1878,7 @@ def create_app():
         web.get('/upload/verify', server.handle_verify_integrity),  # 新增完整性验证接口
         web.get('/ws', server.handle_websocket),
         web.get('/files/list', server.handle_list_files),
+        web.get('/download', server.handle_download),  # 新增下载接口
     ])
     
     return app
@@ -1772,3 +1887,6 @@ if __name__ == '__main__':
     app = create_app()
     # 在IPv6上运行
     web.run_app(app, host='::', port=8080)
+
+
+
